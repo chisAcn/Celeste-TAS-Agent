@@ -674,3 +674,94 @@ Deterministic coverage: `tests/test_live_search.py` drives a one-dimensional
 fake bridge with a death line, and asserts that the second attempt starts at
 the checkpoint (x=5) rather than at the entrance (x=0), that `--no-checkpoint`
 keeps every start at 0, and that a trace with no landing is never promoted.
+
+## Room 8 is behind us: the pocket exits to 8b (2026-11-19)
+
+The last 4px of the reference hyper turned out not to be needed. The exit is
+reached from the jump-through at `2904..2912, y-1792`, and the run that finally
+crossed `x3016` ended in room 8b:
+
+```
+f131041 x3008 y-1808  d1      <- standing on the far side of the pit
+right+dash:1 -> x3015, still StDash
+settled: room 8b, (3020,-1808)
+```
+
+Room 8's respawn point is the pad itself (`reset_room` -> `(2908,-1792)`,
+`dashes 1`), so every attempt after that costs no opening at all.
+
+## Room 8b, solved end to end (2026-11-19)
+
+8b is two zip movers and a 16px shaft. The map (`get_tiles`, runs in world x):
+
+```
+-1848..-1840  #3088..3184   a beam with two legs, gap 3120..3152
+-1832..-1816  #3096..3120   #3152..3184   #3232..3264
+-1808         #3016..3048   #3096..3104
+-1792         #3016..3072                 <- the ledge you spawn on
+-1760/-1752   Z3152..3184 (32x16)  Z3240..3288 (48x16)
+-1816..-1856  ^3264..3272  ^3288..3296     the shaft between them
+-1864..-1888  #3288..3336   solid wall, climbable
+-1880..-1904  shaft widens to 3272..3304    up exit at 3272..3296
+```
+
+Both movers zip 48-56px **up** when touched and then return, on their own,
+about every second, so the ride can be re-taken without leaving the block.
+
+### Getting onto the second mover
+
+```
+right:36                 walk off the ledge at 3076
+right+dash:1  right:24   dash into the pit, land on mover 1 at (3155,-1760)
+_:22                     let it start rising
+right+dash:1  right:2    dash, then on the dash's tail...
+right+jump:2             ...jump -> super, v(260,-140)
+right:34                 fly right, land on mover 2 near (3274,-1752)
+```
+
+Landing anywhere left of `3264` is fatal: the column `3232..3264` (bottom
+`-1816`) crushes her when the mover tops out at `-1808`. `3274` is the spot:
+the shaft is 16px wide and her hitbox is 8, so the centre has to sit in
+`3276..3284`; the spike hitboxes are only 3px wide (`3264..3267` and
+`3293..3296`), so 3274 clears them.
+
+### The shaft
+
+Waiting for the mover to reach `-1808` and then:
+
+```
+up+jump:19            apex (3274,-1835), 27px above the ride height
+right+up+dash:1       diagonal up-dash through the widened part
+up:10                 drift
+right+grab:20  up+grab  grab the solid wall face at 3304, climb
+```
+
+That lands her on the step at `(3300,-1872)` (`#3288..3336` top `-1872`).
+From there the exit is 32px up and the room has no refill, so:
+
+```
+left:8               to 3290, inside the 3272..3296 exit band
+up+jump:1  up:8      jump
+up+dash:1  up:14     up-dash through the ceiling gap
+```
+
+-> `settled room 9 (3287,-1941)`, alive, `dashes 1`.
+
+Two lessons the probes paid for:
+
+- The mover phase has to be **observed**, not counted: it re-triggers by itself
+  while she stands on it, so a fixed wait drifts. `logs/climb.py` polls
+  `get_entities` until the tall mover reads `y <= -1806` and only then sends the
+  jump.
+- `logs/lab_pad.py` (reset + ending) and `logs/lab_slot.py` (SpeedrunTool slot +
+  ending) make the two iteration styles cheap: 8b took ~30 trials because the
+  slot could sit on the mover.
+
+## Room 9 is a new problem
+
+Entered at `(3287,-1928)` on a jump-through. The exit is the right edge at
+`y-2064..-2048`, 136px up. The obvious line -- grab the left wall at 3272 and
+climb -- **runs out of stamina at `-2014`**: climbing costs ~45/s against 110
+stamina, so ~86px is the ceiling and she slides back to the floor. The wall is
+a red herring above that height; the reference spends its stamina in short
+bursts and dashes between `3312..3336` and the right-hand ledges instead.
