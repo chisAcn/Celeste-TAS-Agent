@@ -10,7 +10,9 @@ obj/
 *.dll
 *.pdb
 logs/
-data/
+data/*
+# replay fixture the TAS loader tests read; the rest of data/ stays local
+!data/1A-through-6b.tas
 dashboard/node_modules/
 dashboard/dist/
 .workbuddy/
