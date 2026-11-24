@@ -74,6 +74,7 @@ class Success(Schema):
     """
 
     on_ground: bool | None = None
+    room: str | None = None
     stance: Stance | None = None
     min_dashes: int | None = Field(default=None, ge=0)
     x: Band | None = None
@@ -131,7 +132,9 @@ class StepContract(Schema):
     @classmethod
     def for_plan(cls, actions: list[FrameAction], expected_x: Band | None = None,
                  planned: GameState | None = None, slack: int = 30,
-                 position_slack: float = 4.0) -> "StepContract":
+                 position_slack: float = 4.0, *, expected_y: Band | None = None,
+                 stance: Stance | None = None, room: str | None = None,
+                 min_dashes: int | None = None) -> "StepContract":
         """Build a contract for a plan that does not carry one.
 
         Every guard the single-loop version applied by hand is reproduced here:
@@ -141,9 +144,8 @@ class StepContract(Schema):
         """
         pre = Precondition() if planned is None else Precondition.from_state(
             planned, position_slack)
-        ok = Success()
-        if expected_x is not None:
-            ok = Success(x=(float(expected_x[0]), float(expected_x[1])))
+        ok = Success(x=expected_x, y=expected_y, stance=stance, room=room,
+                     min_dashes=min_dashes)
         total = sum(action.frames for action in actions)
         return cls(pre=pre, ok=ok, abort=Abort(timeout_frames=total + slack))
 

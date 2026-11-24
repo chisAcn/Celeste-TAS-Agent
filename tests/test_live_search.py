@@ -155,3 +155,90 @@ def test_a_candidate_that_never_lands_is_not_a_checkpoint(slot):
     report = run_search(slot, budget=2)
     assert report["rollbacks"] == 0
     assert slot.world.x == 0.0
+
+def test_policy_prefers_rewarded_action_with_one_attempt(slot):
+    options = dict(dx=3, radius=0, frames=3, checkpoint=False)
+    training = run_search(slot, **options)
+    from agent.local_policy import train
+
+    report = run_search(FakeSlot(), **options, budget=1, policy=train([training]), top_k=1)
+    assert report["success"]
+    assert report["evaluations"] == 1
+
+
+def test_exploration_preserves_top_two_and_replays_seed(slot):
+    options = dict(policy={}, top_k=3, checkpoint=False, budget=1)
+    ranked = run_search(slot, **options)["decisions"][0]["selected"]
+    selections = []
+    for seed in (0, 1, 0):
+        report = run_search(slot, **options, explore_last=True, seed=seed)
+        selection = report["decisions"][0]["selected"]
+        assert selection[:2] == ranked[:2]
+        assert len({tuple(action) for action in selection}) == 3
+        selections.append(selection)
+    assert selections[0] == selections[2]
+    assert selections[0] != selections[1]
+
+
+def test_retained_exploration_receives_a_second_step(slot):
+    options = dict(policy={}, top_k=3, explore_last=True, seed=0, checkpoint=False,
+                   frames=1, depth=2, width=2, budget=8)
+    for retain in (False, True):
+        report = run_search(slot, **options, retain_exploration=retain)
+        sampled = report["decisions"][0]["selected"][-1]
+        expanded = [t["actions"][0]["buttons"] for t in report["trials"] if t["segments"] == 2]
+        assert (sampled in expanded) == retain
+        assert report["evaluations"] == 8
+
+
+@pytest.mark.parametrize("budget", [1, 2, 3])
+def test_reserved_attempt_executes_sampled_action_within_budget(slot, budget):
+    report = run_search(slot, policy={}, top_k=3, checkpoint=False, budget=budget,
+                        explore_last=True, reserve_last_attempt=True, seed=0)
+    selected = report["decisions"][0]["selected"]
+    executed = [t["actions"][0]["buttons"] for t in report["trials"]]
+    assert executed == [*selected[:budget - 1], selected[-1]]
+
+
+def test_continuation_value_can_keep_a_more_distant_branch(slot):
+    from agent.local_policy import context, key
+
+    state = context(sample(slot.world)["player"], (16, 0))
+    policy = {key(state, [], 1): 1.0}
+    for enabled, expected in ((False, ["right"]), (True, [])):
+        report = run_search(slot, dx=16, frames=1, depth=2, width=1, budget=4,
+                            policy=policy, top_k=3, checkpoint=False,
+                            continuation_ranking=enabled)
+        assert report["trials"][3]["actions"][0]["buttons"] == expected
+
+
+def test_second_segment_duration_competes_within_budget(slot):
+    from agent.local_policy import context, key
+
+    state = context(sample(slot.world)["player"], (2, 0))
+    policy = {key(state, [], 1): 0.5, key(state, ["right"], 2): 1.0}
+    report = run_search(slot, dx=2, radius=0, frames=1, depth=2, width=1,
+                        budget=2, min_segments=2, top_k=1, checkpoint=False,
+                        policy=policy, second_frames=[1, 2, 2])
+    assert report["success"] and report["evaluations"] == 2
+    assert report["winner"]["actions"][-1] == {"buttons": ["right"], "frames": 2}
+    second = report["decisions"][1]
+    assert (second["hits"], second["candidates"], second["selected_frames"]) == (2, 14, [2])
+
+
+def test_repeated_unscored_states_count_distinct_failed_tasks(slot):
+    from agent.local_policy import repeated_unscored_states, train
+
+    report = run_search(slot, policy={}, checkpoint=False, budget=1)
+    state = tuple(report["decisions"][0]["state"])
+    assert not repeated_unscored_states([report, report])
+    other = dict(report, target=[11, 0])
+    assert repeated_unscored_states([report, other]) == {state}
+    assert not repeated_unscored_states([report, dict(other, success=True)])
+    assert train([report], states_to_fit=set()) == {}
+
+
+def test_reserved_third_action_fits_in_eight_evaluations(slot):
+    report = run_search(slot, dx=80, frames=1, depth=3, width=2, budget=8,
+                        policy={}, top_k=3, checkpoint=False, reserve_third_attempt=True)
+    assert [t["segments"] for t in report["trials"]] == [1, 1, 1, 2, 2, 2, 2, 3]

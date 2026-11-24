@@ -77,6 +77,8 @@ class ExecutorAgent:
             return "player_unavailable"
         if player.dead:
             return "player_dead"
+        if ok.room is not None and state.room.name != ok.room:
+            return "wrong_room"
         if ok.on_ground is not None and player.on_ground != ok.on_ground:
             return "not_grounded"
         if ok.stance is not None and player.stance() != ok.stance:

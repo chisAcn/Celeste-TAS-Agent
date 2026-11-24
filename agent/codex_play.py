@@ -53,7 +53,20 @@ class CodexPlanner:
         with TemporaryDirectory(prefix="celeste-codex-") as directory:
             schema = Path(directory) / "schema.json"
             result = Path(directory) / "plan.json"
-            schema.write_text(json.dumps(self.plan_type.model_json_schema()), encoding="utf-8")
+            definition = self.plan_type.model_json_schema()
+            # Structured output requires optional properties to be required but nullable.
+            def strict(node):
+                if isinstance(node, dict):
+                    node.pop("default", None)
+                    if node.get("type") == "object":
+                        node["required"] = list(node.get("properties", {}))
+                    for value in node.values():
+                        strict(value)
+                elif isinstance(node, list):
+                    for value in node:
+                        strict(value)
+            strict(definition)
+            schema.write_text(json.dumps(definition), encoding="utf-8")
             # Allow Codex time to fall back to HTTPS if WebSocket retries fail.
             code, _ = await self._call([
                 "--ask-for-approval", "never", "exec", "--sandbox", "read-only",

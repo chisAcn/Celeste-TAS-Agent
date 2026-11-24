@@ -1,9 +1,13 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import uuid
 from pathlib import Path
+from typing import Literal
+
+from pydantic import Field, model_validator
 
 from agent.agents import ExecutorAgent, PlannerAgent, StepContract, TeamSession
 from agent.agents.planner import skill_hint
@@ -20,12 +24,38 @@ from agent.tas_training import ActionPrior, action_key
 from agent.tools import ToolRegistry
 
 
+def scoped_route_path(route_book, level, capabilities, geometry):
+    identity = {
+        "sid": level.get("sid"), "mode": level.get("mode"),
+        "bridge": capabilities.get("mod_version"), "geometry": geometry,
+    }
+    if not identity["sid"] or not identity["mode"] or not identity["bridge"]:
+        raise CodexPlayError("Route replay requires map and bridge identity.")
+    # Frame counters do not identify a map.
+    identity["geometry"] = {k: v for k, v in geometry.items() if k != "frame"}
+    digest = hashlib.sha256(json.dumps(
+        identity, sort_keys=True).encode()).hexdigest()[:24]
+    return route_book.with_name(f"{route_book.stem}-{digest}{route_book.suffix}")
+
+
 class Plan(Schema):
     goal: str
     reason: str
     actions: list[FrameAction]
     expected_x_min: float
     expected_x_max: float
+    expected_y: list[float] | None = Field(default=None, min_length=2, max_length=2)
+    expected_stance: Literal["ground", "climb", "air"] | None = None
+    expected_room: str | None = None
+    min_dashes: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def ordered_landing(self):
+        if self.expected_x_min > self.expected_x_max:
+            raise ValueError("expected x range is reversed")
+        if self.expected_y and self.expected_y[0] > self.expected_y[1]:
+            raise ValueError("expected y range is reversed")
+        return self
 
 
 DEEPSEEK_INSTRUCTIONS = (
@@ -266,6 +296,8 @@ async def run(client, mode, steps=20, action_prior=None, *, settle=False, exit_r
             # plan is refused before any frame is sent rather than judged after.
             contract = StepContract.for_plan(
                 actions, expected_x=(plan.expected_x_min, plan.expected_x_max),
+                expected_y=plan.expected_y, stance=plan.expected_stance,
+                room=plan.expected_room, min_dashes=plan.min_dashes,
                 planned=state if mode in {"codex", "deepseek"} else None)
             observations = {}
             if aim_notes:
@@ -363,7 +395,14 @@ async def run_collab(client, mode, *, steps=12, skills=None, exit_room=None,
                 "The bridge lacks pause_control; rebuild and reinstall the mod.")
     llm = open_llm(mode)
     codex = CodexPlanner(Plan) if mode == "codex" else None
-    book, origin, dropped = (open_book(route_book) if route_book
+    # Scope persisted routes to the installed map, mode, bridge and geometry.
+    # Legacy unscoped books remain readable through the offline tools.
+    if route_book:
+        level = await client.call("get_level")
+        capabilities = await client.call("ping")
+        geometry = await client.call("get_room_info")
+        route_book = scoped_route_path(route_book, level, capabilities, geometry)
+    book, origin, dropped = (open_book(route_book, seed=route_book) if route_book
                              else (SkillBook(), "none", 0))
     try:
         if codex:

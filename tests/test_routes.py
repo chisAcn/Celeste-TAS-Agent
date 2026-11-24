@@ -1,8 +1,43 @@
 import json
+from copy import deepcopy
+
+import pytest
 
 from agent.agents.routes import SEED, load_book, open_book, save_book
 from agent.agents.skills import Replay, SkillBook
+from agent.codex_play import CodexPlayError
+from agent.main import scoped_route_path
 from agent.protocol import FrameAction, GameState
+
+
+@pytest.mark.parametrize("field", ["sid", "mode", "bridge", "geometry"])
+def test_route_identity_excludes_other_maps_and_versions(tmp_path, field):
+    level = {"sid": "Celeste/1-ForsakenCity", "mode": "Normal"}
+    caps = {"mod_version": "0.3.10"}
+    geometry = {"frame": 1, "room": "6b", "bounds": {"width": 320}}
+    path = tmp_path / "routes.json"
+    original = scoped_route_path(path, level, caps, geometry)
+    book = SkillBook()
+    book.add(route())
+    save_book(book, original)
+    other_level, other_caps, other_geometry = deepcopy(level), deepcopy(caps), deepcopy(geometry)
+    if field in {"sid", "mode"}:
+        other_level[field] = "different"
+    elif field == "bridge":
+        other_caps["mod_version"] = "new"
+    else:
+        other_geometry["bounds"]["width"] = 640
+    other = scoped_route_path(path, other_level, other_caps, other_geometry)
+    assert other != original
+    assert len(open_book(other, seed=other)[0]) == 0
+    assert len(open_book(original, seed=original)[0]) == 1
+    geometry["frame"] = 999
+    assert scoped_route_path(path, level, caps, geometry) == original
+
+
+def test_missing_identity_refuses_route_replay(tmp_path):
+    with pytest.raises(CodexPlayError, match="identity"):
+        scoped_route_path(tmp_path / "routes.json", {}, {}, {})
 
 
 def state(x=100.0, y=-1000.0, *, room="7", dashes=1, on_ground=True):

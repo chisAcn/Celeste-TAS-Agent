@@ -36,7 +36,10 @@ from agent.tas_training import action_key
 PLANNING_GOAL = (
     "Use grounded intermediate landings. Check recent settled outcomes "
     "before repeating a route. An airborne x coordinate does not "
-    "establish a landing."
+    "establish a landing. Choose the next reachable foothold using terrain and hazards, "
+    "not just the exit direction. Specify expected_y, expected_stance, expected_room "
+    "and min_dashes for that foothold. A failed route should change the next approach, "
+    "using the failure position and sampled trace."
 )
 
 
@@ -116,6 +119,7 @@ class PlannerAgent:
             "state": state.model_dump(),
             "history": self.history[-self.history_limit:],
             "movement_reference": MOVEMENT_REFERENCE,
+            "planning_goal": PLANNING_GOAL,
             "anchor": {
                 "still_for": round(anchor.still_for, 2),
                 "note": ("The world is holding still. This snapshot is what the "
@@ -174,9 +178,12 @@ class PlannerAgent:
                 context["room_knowledge"] = excerpt
                 context["knowledge_guidance"] = GUIDANCE
         geometry = anchor.geometry or {}
-        if geometry.get("exits"):
+        if geometry:
             context["room_geometry"] = geometry
             context["room_geometry_guidance"] = (
+                "collision and tiles describe terrain and hazards. Check their completeness "
+                "flags; missing or truncated geometry never establishes clear space. "
+                "An 8-pixel tile grid is a coarse map; use collision bounds for clearance. "
                 "room_geometry.bounds is the current room rectangle and "
                 "room_geometry.exits lists boundary segments that open into a "
                 "neighbouring room. Each segment gives the side, the target room "
@@ -217,6 +224,10 @@ class PlannerAgent:
         expected = None if low is None or high is None else (low, high)
         return StepContract.for_plan(
             plan.actions if actions is None else actions, expected_x=expected,
+            expected_y=getattr(plan, "expected_y", None),
+            stance=getattr(plan, "expected_stance", None),
+            room=getattr(plan, "expected_room", None),
+            min_dashes=getattr(plan, "min_dashes", None),
             planned=anchor.state, slack=self.slack,
             position_slack=self.frozen_slack if anchor.frozen else self.position_slack)
 
@@ -322,8 +333,9 @@ class PlannerAgent:
                 continue
             started = time.monotonic()
             try:
-                plan = await asyncio.wait_for(self.plan_fn(self.context(anchor)),
-                                              self.timeout + 15)
+                plan = await self._plan_latest(anchor, anchors)
+                if plan is None:
+                    continue
             except asyncio.TimeoutError:
                 await _latest(plans, PlanFailure(anchor_id=anchor.id, kind="timeout",
                                                 detail="model call exceeded the deadline"))
@@ -357,6 +369,24 @@ class PlannerAgent:
                 continue
             self.plans += 1
             await _latest(plans, step)
+
+    async def _plan_latest(self, anchor, anchors):
+        request = asyncio.create_task(self.plan_fn(self.context(anchor)))
+        replacement = asyncio.create_task(anchors.get())
+        try:
+            done, _ = await asyncio.wait(
+                {request, replacement}, timeout=self.timeout + 15,
+                return_when=asyncio.FIRST_COMPLETED)
+            if replacement in done:
+                await _latest(anchors, replacement.result())
+                return None
+            if request in done:
+                return request.result()
+            raise asyncio.TimeoutError
+        finally:
+            request.cancel()
+            replacement.cancel()
+            await asyncio.gather(request, replacement, return_exceptions=True)
 
 
 def _thin(trace, limit: int = 6) -> list[list]:

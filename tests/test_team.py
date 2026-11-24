@@ -21,7 +21,9 @@ from agent.agents import (
     StepContract,
     TeamSession,
 )
-from agent.agents.messages import StepReport, Success
+from agent.agents.executor import ExecutorAgent
+from agent.agents.messages import PlanFailure, StepReport, Success
+from agent.main import Plan
 from agent.protocol import (
     ActionSequence,
     FrameAction,
@@ -31,6 +33,148 @@ from agent.protocol import (
 )
 
 STILL = dict(on_ground=True, vx=0.0, vy=0.0)
+
+
+@pytest.mark.parametrize("change,reason", [
+    ({"room": "other"}, "wrong_room"),
+    ({"y": -1100}, "y_out_of_band"),
+    ({"on_ground": False}, "not_grounded"),
+    ({"dashes": 0}, "no_dash"),
+])
+def test_full_landing_contract_reaches_execution_checks(change, reason):
+    plan = Plan(goal="ledge", reason="fixture", actions=[right()],
+                expected_x_min=1990, expected_x_max=2010,
+                expected_y=(-1130, -1126), expected_stance="ground",
+                expected_room="6b", min_dashes=1)
+    planner = PlannerAgent(lambda _: None)
+    contract = planner.contract(Anchor(id=1, state=state()), plan)
+    executor = ExecutorAgent(None, None)
+    assert executor.success_reason(contract, state()) is None
+    assert executor.success_reason(contract, state(**change)) == reason
+
+
+def test_dynamic_geometry_is_refreshed_and_reaches_planner():
+    async def scenario():
+        session, executor = build(lambda _: None)
+        original = executor.call
+        probes = []
+        async def call(method, **params):
+            if method in {"get_collision", "get_tiles"}:
+                probes.append(method)
+                return {"sample": len(probes), "complete": False}
+            return await original(method, **params)
+        executor.call = call
+        first = await session._publish(state())
+        second = await session._publish(state())
+        context = session.planner.context(second)
+        assert first.geometry["collision"] != second.geometry["collision"]
+        assert probes == ["get_collision", "get_tiles"] * 2
+        assert context["room_geometry"]["collision"]["complete"] is False
+        assert "expected_stance" in context["planning_goal"]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_missing_player_waits_for_real_recovery_or_times_out(recovers):
+    async def scenario():
+        missing = GameState(player=None)
+        executor = StubExecutor(missing)
+        async def plan(_):
+            return FixturePlan([right()])
+        session, _ = build(plan, executor, max_steps=1, respawn_timeout=0.2)
+        async def recover():
+            await asyncio.sleep(0.03)
+            if recovers:
+                executor.state = state()
+        task = asyncio.create_task(recover())
+        try:
+            assert await session.run() == "STOPPED"
+            assert len(executor.runs) == int(recovers)
+            events = [row["state"] for row in session._log]
+            assert ("PLAYER_READY" in events) == recovers
+            assert ("RESPAWN_TIMEOUT" in events) != recovers
+        finally:
+            await task
+    asyncio.run(scenario())
+
+
+def test_replacement_cancels_request_before_planning_new_anchor():
+    async def scenario():
+        started, cancelled = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def plan(context):
+            calls.append(context["state"]["player"]["x"])
+            if len(calls) == 1:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            return FixturePlan([right()])
+
+        planner = PlannerAgent(plan, replay=False)
+        anchors, plans, outcomes = asyncio.Queue(1), asyncio.Queue(1), asyncio.Queue()
+        stop = asyncio.Event()
+        task = asyncio.create_task(planner.serve(anchors, plans, outcomes, stop))
+        try:
+            await anchors.put(Anchor(id=1, state=state(x=10)))
+            await asyncio.wait_for(started.wait(), 1)
+            await anchors.put(Anchor(id=2, state=state(x=20)))
+            step = await asyncio.wait_for(plans.get(), 1)
+            assert cancelled.is_set()
+            assert calls == [10, 20] and step.anchor_id == 2
+            assert planner.failures == 0
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_old_failure_does_not_count_against_new_anchor():
+    async def scenario():
+        session, _ = build(lambda _: None)
+        anchor = Anchor(id=2, state=state())
+        await session.plans.put(PlanFailure(anchor_id=1, detail="old failure"))
+        step = PlannedStep(anchor_id=2, actions=[right()],
+                           contract=StepContract.for_plan([right()], planned=anchor.state))
+        task = asyncio.create_task(session._await_plan(anchor, float("inf")))
+        await asyncio.sleep(0)
+        await session.plans.put(step)
+        assert await asyncio.wait_for(task, 1) is step
+        assert session.stats.plan_failures == 0
+        assert session.stats.superseded == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("source", ["observation", "execution", "settling"])
+def test_exit_success_requires_executed_transition(source):
+    async def scenario():
+        async def plan(_):
+            return FixturePlan([right()])
+        session, executor = build(plan, exit_room="6b")
+        destination = state(room="6c")
+        if source == "observation":
+            executor.state = destination
+        else:
+            original = executor.run
+            async def execute(sequence, contract):
+                report = await original(sequence, contract)
+                if source == "execution":
+                    report.end = destination
+                    executor.state = destination
+                return report
+            executor.run = execute
+            if source == "settling":
+                async def settle(_):
+                    return destination
+                session._settle = settle
+        verdict = await session.run()
+        assert verdict == ("SUCCESS" if source == "execution" else "STOPPED")
+        exits = [row for row in session._log if row["state"] == "EXIT"]
+        assert exits[-1]["source"] == source
+    asyncio.run(scenario())
 
 
 def state(x=2000.0, y=-1128.0, *, dead=False, dashes=1, room="6b", **motion):
@@ -87,6 +231,8 @@ class StubExecutor:
                                "from": -1200, "to": -1100}]}
         if method == "get_platforms":
             return {"platforms": [], "total": 0}
+        if method in {"get_collision", "get_tiles"}:
+            raise RuntimeError("unsupported probe")
         raise AssertionError(f"unexpected call {method}")
 
     async def run(self, sequence, contract):

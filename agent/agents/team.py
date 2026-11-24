@@ -80,6 +80,7 @@ class Option:
     anchor_timeout: float = 8.0
     unstable: str = "wait"
     settle_timeout: float = 2.5
+    respawn_timeout: float = 5.0
     think_budget: float = 90.0
     frozen_slack: float = 8.0
     telemetry: bool = True
@@ -152,11 +153,13 @@ class TeamSession:
             state = self._ready or await self.executor.observe()
             self._ready = None
             if self._done(state):
-                self.event({"state": "EXIT", "verdict": "SUCCESS"})
-                return "SUCCESS"
+                self.event({"state": "EXIT", "verdict": "STOPPED", "source": "observation"})
+                return "STOPPED"
             if state.player is None:
                 self.event({"state": "NO_PLAYER"})
-                return "STOPPED"
+                await self._wait_playable()
+                self.standby.reset()
+                continue
 
             now = time.monotonic()
             stance = self.standby.observe(state, now)
@@ -184,9 +187,12 @@ class TeamSession:
             if outcome.verdict == "DIED":
                 await self._wait_playable()
                 self.standby.reset()
-            if self._done(outcome.settled or outcome.report.end):
-                self.event({"state": "EXIT", "verdict": "SUCCESS"})
+            if (outcome.report.executed_frames > 0 and self._done(outcome.report.end)):
+                self.event({"state": "EXIT", "verdict": "SUCCESS", "source": "execution"})
                 return "SUCCESS"
+            if self._done(outcome.settled):
+                self.event({"state": "EXIT", "verdict": "STOPPED", "source": "settling"})
+                return "STOPPED"
             if retries >= self.option.max_retries:
                 self.event({"state": "RETRY_LIMIT", "retries": retries})
                 return "FAILED"
@@ -217,6 +223,17 @@ class TeamSession:
     async def _publish(self, state, *, still_for=0.0, frozen=False) -> Anchor:
         self._counter += 1
         geometry = await self._room_geometry(state.room.name)
+        # Moving hazards and platforms must be sampled for each anchor.
+        geometry = dict(geometry or {})
+        for method, key, params in (
+            ("get_collision", "collision", {"limit": 128}),
+            ("get_tiles", "tiles", {"whole_room": True}),
+        ):
+            try:
+                geometry[key] = await self.executor.call(method, **params)
+            except RuntimeError:
+                # Older bridges and protocol fixtures may not support these probes.
+                pass
         entities = await self._room_entities(state.room.name)
         platforms = await self._platforms() if self.option.telemetry and self._telemetry else None
         anchor = Anchor(id=self._counter, state=state, still_for=round(still_for, 2),
@@ -284,8 +301,8 @@ class TeamSession:
                     continue
                 state = await self.executor.observe()
                 if self._done(state):
-                    self.event({"state": "EXIT", "verdict": "SUCCESS"})
-                    raise _Finished("SUCCESS", "left the room while planning")
+                    self.event({"state": "EXIT", "verdict": "STOPPED", "source": "while_planning"})
+                    raise _Finished("STOPPED", "target reached outside agent execution")
                 lost = self._lost(anchor, state)
                 if lost is not None:
                     self.stats.superseded += 1
@@ -296,6 +313,11 @@ class TeamSession:
                 self._check_deadline(deadline)
                 continue
 
+            if message.anchor_id != anchor.id:
+                self.stats.superseded += 1
+                self.event({"state": "SUPERSEDED", "anchor": anchor.id,
+                            "plan_anchor": message.anchor_id})
+                continue
             if isinstance(message, PlanFailure):
                 self.stats.plan_failures += 1
                 self.event({"state": "PLAN_FAILED", "anchor": anchor.id,
@@ -303,12 +325,6 @@ class TeamSession:
                 if self.stats.plan_failures >= self.option.max_plan_failures:
                     raise _Finished("FAILED", f"planner failed: {message.detail}")
                 return None
-
-            if message.anchor_id != anchor.id:
-                self.stats.superseded += 1
-                self.event({"state": "SUPERSEDED", "anchor": anchor.id,
-                            "plan_anchor": message.anchor_id})
-                continue
 
             # Pre-flight: the anchor promise is checked before any input, so the
             # executor never has to reject a step it already started.
@@ -410,15 +426,21 @@ class TeamSession:
 
     async def _wait_playable(self) -> None:
         """The room respawns on its own; reloading near a boundary has crashed it."""
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + self.option.respawn_timeout
         while time.monotonic() < deadline:
             try:
                 playable = (await self.executor.call("get_playability")).get("playable")
             except RuntimeError:
                 playable = False
             if playable:
-                return
+                state = await self.executor.observe()
+                if state.player is not None and not state.player.dead:
+                    self._ready = state
+                    self.event({"state": "PLAYER_READY", "at": _point(state)})
+                    return
             await asyncio.sleep(0.08)
+        self.event({"state": "RESPAWN_TIMEOUT"})
+        raise _Finished("STOPPED", "player did not become playable before the deadline")
 
     async def _probe(self) -> None:
         """Ask once what the bridge can do; an optional probe that fails must not
