@@ -1,6 +1,5 @@
 """Configurable candidate routes for timed upper exits."""
 import argparse
-import asyncio
 import itertools
 import json
 import math
