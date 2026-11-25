@@ -200,6 +200,16 @@ def test_reserved_attempt_executes_sampled_action_within_budget(slot, budget):
     assert executed == [*selected[:budget - 1], selected[-1]]
 
 
+def test_partial_fallback_promotes_only_unknown_actions(slot):
+    from agent.local_policy import context, key
+
+    state = context(sample(slot.world)["player"], (10, -16))
+    policy = {key(state, [], 6): 0, key(state, ["up", "right", "dash"], 6): -1}
+    report = run_search(slot, dy=-16, policy=policy, budget=1, checkpoint=False,
+                        first_jump_fallback=True, first_dash_fallback=True, top_k=2)
+    assert report["decisions"][0]["selected"] == [[], ["right", "jump"]]
+
+
 def test_continuation_value_can_keep_a_more_distant_branch(slot):
     from agent.local_policy import context, key
 

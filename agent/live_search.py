@@ -291,6 +291,33 @@ async def search(
             policy_candidates += len(choices)
             choices = [a for a, _ in sorted(scored, key=lambda pair: pair[1] or 0, reverse=True)]
             source = stage if table is not policy else "base"
+            if (0 < hits < len(scored) and goal[1] < player["y"]
+                    and all(value is None or value <= 0 for _, value in scored)):
+                terminal = bool(prefix) and len(prefix) == depth - 1
+                prefer_jump = ((not prefix and first_jump_fallback)
+                               or (terminal and terminal_jump_fallback and player["on_ground"]))
+                prefer_dash = player["dashes"] > 0 and (
+                    (not prefix and first_jump_fallback and first_dash_fallback)
+                    or (terminal and directional_fallback))
+                horizontal = goal[0] - player["x"]
+                if horizontal == 0 and terminal and prefer_jump:
+                    horizontal = goal[0] - baseline["player"]["x"]
+                direction = "left" if horizontal < 0 else "right"
+                if prefer_jump or prefer_dash:
+                    unknown_slots = [i for i, a in enumerate(choices)
+                                     if key(state, a.buttons, a.frames) not in table]
+                    def priority(action):
+                        if direction in action.buttons:
+                            if prefer_jump and "jump" in action.buttons:
+                                return 0
+                            if prefer_dash and "dash" in action.buttons:
+                                return 1
+                        return 2
+
+                    ranked = sorted((choices[i] for i in unknown_slots), key=priority)
+                    for i, action in zip(unknown_slots, ranked):
+                        choices[i] = action
+                    source += "_partial_fallback"
             if (first_jump_fallback and not prefix and goal[1] < player["y"]
                     and hits == 0):
                 direction = "right" if goal[0] >= player["x"] else "left"
