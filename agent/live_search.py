@@ -290,6 +290,7 @@ async def search(
             policy_hits += hits
             policy_candidates += len(choices)
             choices = [a for a, _ in sorted(scored, key=lambda pair: pair[1] or 0, reverse=True)]
+            before_fallback = choices.copy()
             source = stage if table is not policy else "base"
             if (0 < hits < len(scored) and goal[1] < player["y"]
                     and all(value is None or value <= 0 for _, value in scored)):
@@ -348,6 +349,12 @@ async def search(
                 jump = next(i for i, a in enumerate(choices) if "jump" in a.buttons and direction in a.buttons)
                 choices.insert(0, choices.pop(jump))
                 source = "terminal_jump"
+            candidate_scores = [
+                dict(buttons=a.buttons, frames=a.frames, score=value,
+                     rank_before_fallback=before_fallback.index(a) + 1,
+                     rank_after_fallback=choices.index(a) + 1)
+                for a, value in scored
+            ]
         if strategy == "random":
             rng.shuffle(choices)
         elif strategy == "fixed":
@@ -362,6 +369,7 @@ async def search(
             decisions.append(dict(prefix=[a.buttons for a in prefix],
                                   prefix_frames=[a.frames for a in prefix], state=state,
                                   hits=hits, candidates=len(scored),
+                                  candidate_scores=candidate_scores,
                                   source=source,
                                   selected_frames=[a.frames for a in choices[:top_k]],
                                   selected=[a.buttons for a in choices[:top_k]]))

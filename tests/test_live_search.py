@@ -180,6 +180,20 @@ def test_exploration_preserves_top_two_and_replays_seed(slot):
     assert selections[0] != selections[1]
 
 
+def test_training_counts_repeated_observations_and_distinct_starts(slot):
+    from copy import deepcopy
+
+    from agent.local_policy import train
+
+    report = run_search(slot, checkpoint=False, budget=1)
+    other = deepcopy(report)
+    other["trials"][0]["result"]["before"]["room"]["name"] = "other"
+    reports = [report, report, other]
+    stats = {}
+    assert train(reports, stats=stats) == train(reports)
+    assert list(stats.values()) == [{"observations": 3, "distinct_starts": 2}]
+
+
 def test_retained_exploration_receives_a_second_step(slot):
     options = dict(policy={}, top_k=3, explore_last=True, seed=0, checkpoint=False,
                    frames=1, depth=2, width=2, budget=8)
@@ -208,6 +222,12 @@ def test_partial_fallback_promotes_only_unknown_actions(slot):
     report = run_search(slot, dy=-16, policy=policy, budget=1, checkpoint=False,
                         first_jump_fallback=True, first_dash_fallback=True, top_k=2)
     assert report["decisions"][0]["selected"] == [[], ["right", "jump"]]
+    rows = report["decisions"][0]["candidate_scores"]
+    assert len(rows) == 7
+    assert rows[0]["score"] == 0
+    jump = next(row for row in rows if row["buttons"] == ["right", "jump"])
+    assert jump == dict(buttons=["right", "jump"], frames=6, score=None,
+                        rank_before_fallback=5, rank_after_fallback=2)
 
 
 def test_continuation_value_can_keep_a_more_distant_branch(slot):
